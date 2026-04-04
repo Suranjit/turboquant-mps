@@ -1,84 +1,217 @@
 """
-TurboQuant KV-cache integration for HuggingFace Transformers.
+TurboQuant KV-cache integration for HuggingFace Transformers (>= 4.38).
 
-Drop-in replacement for DynamicCache that transparently quantizes each
-key/value tensor as it is written and dequantizes on read.
+Provides TurboQuantDynamicCache, a drop-in replacement for DynamicCache that
+transparently quantizes each key/value tensor using TurboQuant as it is
+written and dequantizes it on read.
 
-Usage:
-    from turboquant.kv_cache import TurboQuantKVCache
-    cache = TurboQuantKVCache(head_dim=128, bits=2, mode="prod")
-    outputs = model.generate(..., past_key_values=cache, ...)
+Compression reality check (per token, per head, head_dim=d):
+  Full FP16:  d * 2  bytes
+  TQ_mse @ b bits:  ceil(b*d/8) + 4 bytes (indices + norm scalar)
+  TQ_prod @ b bits: ceil(b*d/8) + ceil(d/8) + 8 bytes (idx + QJL bits + 2 scalars)
+
+For d=64, b=2:
+  FP16   = 128 bytes
+  TQ_mse = 16 + 4 = 20 bytes  → 6.4x
+  TQ_prod= 16 + 8 + 8 = 32 bytes → 4x
 """
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import torch
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, Any
 
 from .quantizer import TurboQuantMSE, TurboQuantProd
 
+try:
+    from transformers.cache_utils import DynamicLayer, DynamicCache
+    _HAS_DYNAMIC_LAYER = True
+except ImportError:
+    _HAS_DYNAMIC_LAYER = False
 
-class TurboQuantKVCache:
+
+# ---------------------------------------------------------------------------
+# Per-layer quantized cache
+# ---------------------------------------------------------------------------
+
+class TurboQuantLayer:
     """
-    A HuggingFace-compatible KV cache that applies TurboQuant quantization.
+    A single-layer cache that quantizes key and value states on write and
+    dequantizes on read.  Mimics the DynamicLayer interface.
+    """
 
-    Stores:
-      - For "mse"  mode: (idx, norm)   per key/value layer
-      - For "prod" mode: (idx, qjl, qjl_gamma, norm)  per key/value layer
+    is_sliding = False
+    is_initialized = False
 
-    The cache is a list of (key_state, value_state) tuples indexed by layer,
-    following the HuggingFace DynamicCache interface used in transformers >= 4.38.
+    def __init__(self, key_quant: TurboQuantMSE | TurboQuantProd,
+                 val_quant: TurboQuantMSE | TurboQuantProd,
+                 mode: str):
+        self._kq = key_quant   # quantizer for keys
+        self._vq = val_quant   # quantizer for values
+        self.mode = mode
+
+        self._key_store: list  = []   # list of per-chunk compressed tuples
+        self._val_store: list  = []
+        self._seq_len: int = 0
+
+        self.device = None
+        self.dtype  = None
+
+    # ---- DynamicLayer interface ----
+
+    def lazy_initialization(self, key_states: torch.Tensor):
+        self.device = key_states.device
+        self.dtype  = key_states.dtype
+        self.is_initialized = True
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize new states, append to store, return full dequantized cache."""
+        if not self.is_initialized:
+            self.lazy_initialization(key_states)
+
+        # Compress and store new chunk
+        self._key_store.append(self._compress(key_states, self._kq))
+        self._val_store.append(self._compress(value_states, self._vq))
+        self._seq_len += key_states.shape[-2]
+
+        # Reconstruct and return full accumulated cache
+        full_keys = self._decompress_all(self._key_store, self._kq)
+        full_vals = self._decompress_all(self._val_store, self._vq)
+
+        return (
+            torch.from_numpy(full_keys).to(device=self.device, dtype=self.dtype),
+            torch.from_numpy(full_vals).to(device=self.device, dtype=self.dtype),
+        )
+
+    def get_seq_length(self) -> int:
+        return self._seq_len
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> Tuple[int, int]:
+        kv_offset = 0
+        query_length = cache_position.shape[0]
+        kv_length = self._seq_len + query_length
+        return kv_length, kv_offset
+
+    def get_max_cache_shape(self) -> int:
+        return -1  # unlimited
+
+    # ---- Compression helpers ----
+
+    def _compress(self, tensor: torch.Tensor, q):
+        """Quantize (B, H, T, d) tensor; return compressed tuple."""
+        x = tensor.float().cpu().numpy()    # (B, H, T, d)
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, q.d)         # (B*H*T, d)
+
+        if self.mode == "mse":
+            idx, norms = q.quant_with_norm(x_flat)
+            return ("mse", idx, norms, orig_shape)
+        else:
+            idx, qjl, qjl_gamma, norms = q.quant_with_norm(x_flat)
+            return ("prod", idx, qjl, qjl_gamma, norms, orig_shape)
+
+    def _decompress_chunk(self, chunk, q) -> np.ndarray:
+        """Dequantize a single compressed chunk back to float32 numpy."""
+        if chunk[0] == "mse":
+            _, idx, norms, orig_shape = chunk
+            x_flat = q.dequant_with_norm(idx, norms)
+        else:
+            _, idx, qjl, qjl_gamma, norms, orig_shape = chunk
+            x_flat = q.dequant_with_norm(idx, qjl, qjl_gamma, norms)
+        return x_flat.reshape(orig_shape)
+
+    def _decompress_all(self, store: list, q) -> np.ndarray:
+        """Decompress all chunks and concatenate along the T dimension."""
+        chunks = [self._decompress_chunk(c, q) for c in store]
+        return np.concatenate(chunks, axis=-2)   # concat along seq dim
+
+    # ---- Memory accounting ----
+
+    def compressed_bytes(self) -> int:
+        """Theoretical compressed size in bytes (using optimal bit packing)."""
+        total = 0
+        for chunk in self._key_store + self._val_store:
+            if chunk[0] == "mse":
+                _, idx, norms, orig_shape = chunk
+                B, H, T, d = orig_shape
+                b_per_coord = int(round(math.log2(idx.max() + 1 + 1e-9)))
+                # Ceil(b*d/8) bytes for packed indices + 4 bytes per vector for norm
+                total += math.ceil(b_per_coord * d / 8) * B * H * T
+                total += 4 * B * H * T          # float32 norms
+            else:
+                _, idx, qjl, qjl_gamma, norms, orig_shape = chunk
+                B, H, T, d = orig_shape
+                b_per_coord = int(round(math.log2(idx.max() + 1 + 1e-9)))
+                total += math.ceil(b_per_coord * d / 8) * B * H * T   # idx
+                total += math.ceil(d / 8) * B * H * T                 # QJL bits
+                total += 4 * B * H * T   # qjl_gamma (float32)
+                total += 4 * B * H * T   # norms (float32)
+        return total
+
+    def fp16_bytes(self) -> int:
+        """What this cache would cost at full FP16 precision."""
+        total = 0
+        for chunk in self._key_store + self._val_store:
+            orig_shape = chunk[-1]
+            B, H, T, d = orig_shape
+            total += B * H * T * d * 2   # 2 bytes per FP16 element
+        return total
+
+
+# ---------------------------------------------------------------------------
+# Full-model TurboQuant cache (all layers)
+# ---------------------------------------------------------------------------
+
+class TurboQuantDynamicCache:
+    """
+    Drop-in replacement for transformers DynamicCache that applies TurboQuant
+    quantization to all KV tensors.
+
+    The interface matches DynamicCache from transformers >= 4.38 / 4.57.
+
+    Args:
+        head_dim: Dimension of each attention head (d in the paper).
+        bits:     Bits per coordinate (b in the paper).
+        mode:     "mse" for MSE-optimal, "prod" for unbiased inner-product.
+        seed:     RNG seed for reproducibility.
     """
 
     def __init__(
         self,
         head_dim: int,
-        bits: int = 2,
+        bits: int,
         mode: str = "prod",
         seed: int = 42,
     ):
-        """
-        Args:
-            head_dim: Dimension of each attention head (d in the paper).
-            bits:     Bits per coordinate for quantization (b in the paper).
-            mode:     "mse" for TurboQuantMSE, "prod" for TurboQuantProd.
-            seed:     RNG seed for reproducibility.
-        """
         if mode not in ("mse", "prod"):
             raise ValueError(f"mode must be 'mse' or 'prod', got '{mode}'")
         self.head_dim = head_dim
         self.bits = bits
         self.mode = mode
 
-        if mode == "mse":
-            self._quant = TurboQuantMSE(head_dim, bits, seed=seed)
+        rng = np.random.default_rng(seed)
+        self._rng = rng
+        self._layers: list[TurboQuantLayer] = []
+
+    def _make_layer(self) -> TurboQuantLayer:
+        seed_k = int(self._rng.integers(0, 2**31))
+        seed_v = int(self._rng.integers(0, 2**31))
+        if self.mode == "mse":
+            kq = TurboQuantMSE(self.head_dim, self.bits, seed=seed_k)
+            vq = TurboQuantMSE(self.head_dim, self.bits, seed=seed_v)
         else:
-            self._quant = TurboQuantProd(head_dim, bits, seed=seed)
+            kq = TurboQuantProd(self.head_dim, self.bits, seed=seed_k)
+            vq = TurboQuantProd(self.head_dim, self.bits, seed=seed_v)
+        return TurboQuantLayer(kq, vq, self.mode)
 
-        # Internal storage: list of dicts, one per layer
-        # Each dict has keys "key" and "value", each holding a compressed tuple.
-        self._key_cache: list[list] = []
-        self._value_cache: list[list] = []
-
-        # Keep track of how many tokens are cached per layer
-        self._seen_tokens: int = 0
-
-    # ------------------------------------------------------------------
-    # HuggingFace Cache interface
-    # ------------------------------------------------------------------
-
-    def __len__(self) -> int:
-        return len(self._key_cache)
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        if len(self._key_cache) <= layer_idx:
-            return 0
-        return self._key_cache[layer_idx][0].shape[1] if self.mode == "mse" else \
-               self._key_cache[layer_idx][0].shape[1]
-
-    def get_max_length(self) -> Optional[int]:
-        return None  # unlimited
+    # ---- Cache interface ----
 
     def update(
         self,
@@ -87,139 +220,52 @@ class TurboQuantKVCache:
         layer_idx: int,
         cache_kwargs: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Append key/value states for layer_idx, quantize them, and return the
-        full (accumulated) dequantized key/value tensors.
+        """Quantize and append; return full dequantized (key, value) for the layer."""
+        while len(self._layers) <= layer_idx:
+            self._layers.append(self._make_layer())
+        return self._layers[layer_idx].update(key_states, value_states, cache_kwargs)
 
-        key_states / value_states shape: (batch, num_heads, seq_len, head_dim)
-        """
-        device = key_states.device
-        dtype = key_states.dtype
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        if layer_idx >= len(self._layers):
+            return 0
+        return self._layers[layer_idx].get_seq_length()
 
-        # Extend storage list if needed
-        while len(self._key_cache) <= layer_idx:
-            self._key_cache.append(None)
-            self._value_cache.append(None)
+    def get_max_length(self) -> Optional[int]:
+        return None
 
-        # Quantize new tokens
-        key_q = self._compress(key_states)    # quantized representation
-        val_q = self._compress(value_states)
+    def get_mask_sizes(self, cache_position: "torch.Tensor", layer_idx: int) -> tuple:
+        """Return (kv_length, kv_offset) for attention mask construction."""
+        if layer_idx >= len(self._layers):
+            return cache_position.shape[0], 0
+        return self._layers[layer_idx].get_mask_sizes(cache_position)
 
-        # Accumulate
-        if self._key_cache[layer_idx] is None:
-            self._key_cache[layer_idx] = key_q
-            self._value_cache[layer_idx] = val_q
-        else:
-            self._key_cache[layer_idx] = self._concat(
-                self._key_cache[layer_idx], key_q
-            )
-            self._value_cache[layer_idx] = self._concat(
-                self._value_cache[layer_idx], val_q
-            )
+    @property
+    def seen_tokens(self) -> int:
+        return self.get_seq_length(0)
 
-        if layer_idx == 0:
-            self._seen_tokens += key_states.shape[-2]
+    def __len__(self) -> int:
+        return len(self._layers)
 
-        # Dequantize the full cache and return as torch tensors
-        full_keys = self._decompress(self._key_cache[layer_idx], device, dtype)
-        full_vals = self._decompress(self._value_cache[layer_idx], device, dtype)
-        return full_keys, full_vals
+    # ---- Memory reporting ----
 
-    # ------------------------------------------------------------------
-    # Compression helpers
-    # ------------------------------------------------------------------
+    def compressed_bytes(self) -> int:
+        return sum(layer.compressed_bytes() for layer in self._layers)
 
-    def _compress(self, tensor: torch.Tensor):
-        """
-        Quantize a (batch, heads, seq, head_dim) tensor.
-        Returns a tuple of numpy arrays (compressed representation).
-        """
-        # Move to CPU numpy for TurboQuant (no GPU dependency needed)
-        x = tensor.float().cpu().numpy()           # (B, H, T, d)
-        orig_shape = x.shape
-        # Flatten to (B*H*T, d) for vectorised quantization
-        x_flat = x.reshape(-1, self.head_dim)
-
-        if self.mode == "mse":
-            idx, norms = self._quant.quant_with_norm(x_flat)
-            # Reshape back
-            idx = idx.reshape(*orig_shape[:-1], self.head_dim)
-            norms = norms.reshape(*orig_shape[:-1])
-            return (idx, norms, orig_shape)
-        else:
-            idx, qjl, qjl_gamma, norms = self._quant.quant_with_norm(x_flat)
-            idx = idx.reshape(*orig_shape[:-1], self.head_dim)
-            qjl = qjl.reshape(*orig_shape[:-1], self.head_dim)
-            qjl_gamma = qjl_gamma.reshape(*orig_shape[:-1])
-            norms = norms.reshape(*orig_shape[:-1])
-            return (idx, qjl, qjl_gamma, norms, orig_shape)
-
-    def _decompress(self, compressed, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Dequantize and return a torch tensor on the given device."""
-        if self.mode == "mse":
-            idx, norms, orig_shape = compressed
-            idx_flat = idx.reshape(-1, self.head_dim)
-            norms_flat = norms.reshape(-1)
-            x_flat = self._quant.dequant_with_norm(idx_flat, norms_flat)
-            x = x_flat.reshape(orig_shape)
-        else:
-            idx, qjl, qjl_gamma, norms, orig_shape = compressed
-            idx_flat = idx.reshape(-1, self.head_dim)
-            qjl_flat = qjl.reshape(-1, self.head_dim)
-            qjl_gamma_flat = qjl_gamma.reshape(-1)
-            norms_flat = norms.reshape(-1)
-            x_flat = self._quant.dequant_with_norm(idx_flat, qjl_flat, qjl_gamma_flat, norms_flat)
-            x = x_flat.reshape(orig_shape)
-
-        return torch.from_numpy(x).to(device=device, dtype=dtype)
-
-    def _concat(self, existing, new_compressed):
-        """Concatenate two compressed cache entries along the seq_len dimension (axis -2 / axis 2)."""
-        if self.mode == "mse":
-            idx1, norms1, shape1 = existing
-            idx2, norms2, shape2 = new_compressed
-            idx = np.concatenate([idx1, idx2], axis=-2)
-            norms = np.concatenate([norms1, norms2], axis=-1)
-            combined_shape = (*shape1[:-2], shape1[-2] + shape2[-2], shape1[-1])
-            return (idx, norms, combined_shape)
-        else:
-            idx1, qjl1, g1, norms1, shape1 = existing
-            idx2, qjl2, g2, norms2, shape2 = new_compressed
-            idx = np.concatenate([idx1, idx2], axis=-2)
-            qjl = np.concatenate([qjl1, qjl2], axis=-2)
-            g = np.concatenate([g1, g2], axis=-1)
-            norms = np.concatenate([norms1, norms2], axis=-1)
-            combined_shape = (*shape1[:-2], shape1[-2] + shape2[-2], shape1[-1])
-            return (idx, qjl, g, norms, combined_shape)
-
-    # ------------------------------------------------------------------
-    # Memory reporting
-    # ------------------------------------------------------------------
-
-    def memory_bytes(self) -> dict[str, int]:
-        """Report compressed memory usage vs full FP16 equivalent."""
-        if not self._key_cache or self._key_cache[0] is None:
-            return {"compressed": 0, "fp16_equivalent": 0}
-
-        compressed = 0
-        for layer_k, layer_v in zip(self._key_cache, self._value_cache):
-            for storage in (layer_k, layer_v):
-                for arr in storage[:-1]:  # skip orig_shape tuple
-                    if isinstance(arr, np.ndarray):
-                        compressed += arr.nbytes
-
-        # FP16 equivalent size
-        n_layers = len(self._key_cache)
-        # Reconstruct total token count from stored shape
-        shape = self._key_cache[0][-1]          # orig_shape
-        B, H, T, d = shape
-        fp16 = n_layers * 2 * B * H * T * d * 2  # 2 for K+V, 2 bytes for FP16
-
-        return {"compressed_bytes": compressed, "fp16_equivalent_bytes": fp16}
+    def fp16_bytes(self) -> int:
+        return sum(layer.fp16_bytes() for layer in self._layers)
 
     def compression_ratio(self) -> float:
-        """Ratio of FP16 size to compressed size (higher = better compression)."""
-        mem = self.memory_bytes()
-        if mem["compressed_bytes"] == 0:
+        cb = self.compressed_bytes()
+        if cb == 0:
             return 0.0
-        return mem["fp16_equivalent_bytes"] / mem["compressed_bytes"]
+        return self.fp16_bytes() / cb
+
+    def memory_summary(self) -> str:
+        cb = self.compressed_bytes()
+        fp = self.fp16_bytes()
+        ratio = self.compression_ratio()
+        return (
+            f"Compressed: {cb/1024:.1f} KB  |  "
+            f"FP16 equiv: {fp/1024:.1f} KB  |  "
+            f"Ratio: {ratio:.2f}x"
+        )

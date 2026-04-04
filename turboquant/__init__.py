@@ -20,7 +20,7 @@ Quick start:
 """
 
 from .quantizer import TurboQuantMSE, TurboQuantProd
-from .kv_cache import TurboQuantKVCache
+from .kv_cache import TurboQuantDynamicCache
 
-__all__ = ["TurboQuantMSE", "TurboQuantProd", "TurboQuantKVCache"]
+__all__ = ["TurboQuantMSE", "TurboQuantProd", "TurboQuantDynamicCache"]
 __version__ = "0.1.0"
