@@ -21,6 +21,15 @@ Quick start:
 
 from .quantizer import TurboQuantMSE, TurboQuantProd
 from .kv_cache import TurboQuantDynamicCache
+from .mps_quantizer import MPSTurboQuantMSE, MPSTurboQuantProd
+from .mps_kv_cache import MPSTurboQuantCache
 
-__all__ = ["TurboQuantMSE", "TurboQuantProd", "TurboQuantDynamicCache"]
+__all__ = [
+    "TurboQuantMSE",
+    "TurboQuantProd",
+    "TurboQuantDynamicCache",
+    "MPSTurboQuantMSE",
+    "MPSTurboQuantProd",
+    "MPSTurboQuantCache",
+]
 __version__ = "0.1.0"

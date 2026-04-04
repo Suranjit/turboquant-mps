@@ -181,6 +181,23 @@ def section(title: str, width: int = 70):
     print(f"{'='*width}")
 
 
+def estimate_model_size_gb(cfg) -> float:
+    """
+    Estimate model weight size in GB from config.
+    Uses num_hidden_layers * hidden_size² * 12 as a rough parameter count
+    (covers QKV + output + 2 FFN weight matrices at ~8× hidden_size width).
+    Result is approximate; actual size depends on architecture details.
+    """
+    hidden = cfg.hidden_size
+    layers = cfg.num_hidden_layers
+    ffn = getattr(cfg, "intermediate_size", hidden * 4)
+    # Approximate: attention (4 * hidden²) + FFN (2 * hidden * ffn) per layer
+    # plus embeddings (~vocab * hidden)
+    vocab = getattr(cfg, "vocab_size", 32000)
+    params = layers * (4 * hidden * hidden + 2 * hidden * ffn) + vocab * hidden
+    return params * 2 / 1024**3  # FP16 = 2 bytes per param
+
+
 def run_memory_benchmark(cfg, device: str, bits: int):
     """
     Simulate KV cache fill at increasing context lengths.
@@ -216,8 +233,8 @@ def run_memory_benchmark(cfg, device: str, bits: int):
     print(f"  TurboQuant per token:   {tq_bytes_per_tok_theory/1024:.1f} KB")
     print(f"  Theoretical ratio:      {theory_ratio:.1f}×")
 
-    # Mac RAM tiers to show OOM points
-    ram_tiers = {"8 GB Mac": 8*1024, "16 GB Mac": 16*1024, "32 GB Mac": 32*1024}
+    # Derive model size from config rather than hardcoding
+    model_size_gb = estimate_model_size_gb(cfg)
 
     header = (
         f"\n  {'Context':>10}  {'FP16 KV':>10}  {'TurboQ KV':>11}  "
@@ -225,8 +242,6 @@ def run_memory_benchmark(cfg, device: str, bits: int):
     )
     print(header)
     print("  " + "-" * 66)
-
-    model_size_gb = 2.5  # approximate for Llama 3.2-1B; adjust if needed
 
     results = {}
     for ctx in context_lengths:
@@ -244,7 +259,6 @@ def run_memory_benchmark(cfg, device: str, bits: int):
         tq_str   = f"{tq_mb:.0f} MB"  if tq_mb   < 1024 else f"{tq_mb/1024:.1f} GB"
         ratio_str = f"{fp16_mb/tq_mb:.1f}×"
 
-        # 8GB: compare FP16 vs TQ
         fit_8gb_str = f"{'✓ FP16' if fit_8gb_fp16=='✓' else '✗ FP16'}/{'✓ TQ' if fit_8gb_tq=='✓' else '✗ TQ'}"
         fit_16gb_str = f"{'✓' if fit_16gb_fp16=='✓' else '✗'}/{'✓' if fit_16gb_tq=='✓' else '✗'}"
 

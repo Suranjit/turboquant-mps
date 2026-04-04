@@ -135,24 +135,31 @@ class TurboQuantLayer:
     # ---- Memory accounting ----
 
     def compressed_bytes(self) -> int:
-        """Theoretical compressed size in bytes (using optimal bit packing)."""
+        """
+        Theoretical compressed size in bytes using optimal bit packing.
+
+        Uses the actual bit-width from the quantizer (self._kq.b / self._vq.b)
+        rather than inferring it from index values, which is unreliable when
+        all indices happen to be 0.
+        """
         total = 0
-        for chunk in self._key_store + self._val_store:
-            if chunk[0] == "mse":
-                _, idx, norms, orig_shape = chunk
-                B, H, T, d = orig_shape
-                b_per_coord = int(round(math.log2(idx.max() + 1 + 1e-9)))
-                # Ceil(b*d/8) bytes for packed indices + 4 bytes per vector for norm
-                total += math.ceil(b_per_coord * d / 8) * B * H * T
-                total += 4 * B * H * T          # float32 norms
-            else:
-                _, idx, qjl, qjl_gamma, norms, orig_shape = chunk
-                B, H, T, d = orig_shape
-                b_per_coord = int(round(math.log2(idx.max() + 1 + 1e-9)))
-                total += math.ceil(b_per_coord * d / 8) * B * H * T   # idx
-                total += math.ceil(d / 8) * B * H * T                 # QJL bits
-                total += 4 * B * H * T   # qjl_gamma (float32)
-                total += 4 * B * H * T   # norms (float32)
+        for store, q in ((self._key_store, self._kq), (self._val_store, self._vq)):
+            b = q.b
+            d = q.d
+            for chunk in store:
+                orig_shape = chunk[-1]
+                B, H, T, _ = orig_shape
+                if chunk[0] == "mse":
+                    # ceil(b*d/8) bytes for packed indices + 4 bytes (float32) per norm
+                    total += math.ceil(b * d / 8) * B * H * T
+                    total += 4 * B * H * T
+                else:
+                    # MSE part at (b-1) bits + QJL 1 bit + two float32 scalars
+                    b_mse = max(b - 1, 1)
+                    total += math.ceil(b_mse * d / 8) * B * H * T   # packed idx
+                    total += math.ceil(d / 8) * B * H * T           # QJL bits
+                    total += 4 * B * H * T   # qjl_gamma (float32)
+                    total += 4 * B * H * T   # norms (float32)
         return total
 
     def fp16_bytes(self) -> int:

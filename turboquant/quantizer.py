@@ -100,11 +100,17 @@ class TurboQuantMSE:
         return x̃ * norms[..., np.newaxis]
 
     def mse(self, x: np.ndarray) -> float:
-        """Convenience: compute empirical MSE D_mse on a batch of vectors."""
+        """
+        Empirical D_mse = E[‖x − x̃‖²] on a batch of vectors.
+
+        This matches the paper's definition: mean over vectors of the full
+        squared reconstruction error (sum over all d coordinates), NOT the
+        per-element mean.
+        """
         x = np.asarray(x, dtype=np.float32)
         idx = self.quant(x)
         x̃ = self.dequant(idx)
-        return float(np.mean((x - x̃) ** 2))
+        return float(np.mean(np.sum((x - x̃) ** 2, axis=-1)))
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -48,6 +48,11 @@ class MPSTurboQuantLayer:
         self._v_gamma: list[torch.Tensor] = []
         self._v_norm:  list[torch.Tensor] = []
 
+        # Incremental reconstruction cache: avoids re-decompressing all prior
+        # tokens on every update step (O(T²) → O(T) total decompression work).
+        self._full_k: Optional[torch.Tensor] = None
+        self._full_v: Optional[torch.Tensor] = None
+
         self._seq_len: int = 0
         self.is_initialized = False
 
@@ -98,10 +103,20 @@ class MPSTurboQuantLayer:
 
         self._seq_len += T
 
-        # Reconstruct full key/value tensors
-        full_k = self._dequant_all("k", B, H)
-        full_v = self._dequant_all("v", B, H)
-        return full_k.to(key_states.dtype), full_v.to(value_states.dtype)
+        # Decompress only the new chunk, then cat onto the cached reconstruction.
+        # This reduces total decompression work from O(T²) to O(T).
+        new_k = self._dequant_chunk(ki, kq, kg, kn, self._kq, B, H, T)
+        new_v = self._dequant_chunk(vi, vq, vg, vn, self._vq, B, H, T)
+
+        self._full_k = (
+            torch.cat([self._full_k, new_k], dim=2)
+            if self._full_k is not None else new_k
+        )
+        self._full_v = (
+            torch.cat([self._full_v, new_v], dim=2)
+            if self._full_v is not None else new_v
+        )
+        return self._full_k.to(key_states.dtype), self._full_v.to(value_states.dtype)
 
     def get_seq_length(self) -> int:
         return self._seq_len
@@ -116,26 +131,24 @@ class MPSTurboQuantLayer:
 
     # ---- Reconstruction ----
 
-    def _dequant_all(self, kv: str, B: int, H: int) -> torch.Tensor:
-        """Dequantize and concatenate all chunks for key or value."""
-        q = self._kq if kv == "k" else self._vq
-        idx_list   = self._k_idx   if kv == "k" else self._v_idx
-        qjl_list   = self._k_qjl  if kv == "k" else self._v_qjl
-        gamma_list = self._k_gamma if kv == "k" else self._v_gamma
-        norm_list  = self._k_norm  if kv == "k" else self._v_norm
-
-        chunks = []
-        for idx, qjl, gamma, norm in zip(idx_list, qjl_list, gamma_list, norm_list):
-            T_chunk = idx.shape[2]
-            # Flatten (B, H, T, n_bytes) → (B*H*T, n_bytes)
-            flat_idx   = idx.reshape(-1, idx.shape[-1])
-            flat_qjl   = qjl.reshape(-1, qjl.shape[-1])
-            flat_gamma = gamma.reshape(-1)
-            flat_norm  = norm.reshape(-1)
-            x_flat = q.dequant_unpack(flat_idx, flat_qjl, flat_gamma, flat_norm)
-            chunks.append(x_flat.reshape(B, H, T_chunk, q.d))
-
-        return torch.cat(chunks, dim=2)   # (B, H, T_total, d)
+    def _dequant_chunk(
+        self,
+        idx: torch.Tensor,
+        qjl: torch.Tensor,
+        gamma: torch.Tensor,
+        norm: torch.Tensor,
+        q,
+        B: int,
+        H: int,
+        T: int,
+    ) -> torch.Tensor:
+        """Dequantize a single packed chunk; returns (B, H, T, d)."""
+        flat_idx   = idx.reshape(-1, idx.shape[-1])
+        flat_qjl   = qjl.reshape(-1, qjl.shape[-1])
+        flat_gamma = gamma.reshape(-1)
+        flat_norm  = norm.reshape(-1)
+        x_flat = q.dequant_unpack(flat_idx, flat_qjl, flat_gamma, flat_norm)
+        return x_flat.reshape(B, H, T, q.d)
 
     # ---- Memory accounting ----
 

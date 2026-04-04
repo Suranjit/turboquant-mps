@@ -9,9 +9,9 @@ setup(
     install_requires=[
         "numpy>=1.24",
         "scipy>=1.10",
-        "matplotlib>=3.7",
+        "torch>=2.1",
     ],
     extras_require={
-        "llm": ["torch>=2.1", "transformers>=4.38"],
+        "llm": ["transformers>=4.38", "accelerate>=0.26", "matplotlib>=3.7"],
     },
 )
