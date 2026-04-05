@@ -6,8 +6,8 @@ Compressed state is stored as compact int16 tensors (bit-packed),
 giving 4-5× memory reduction for b=2 bits at typical head dimensions.
 
 Compressed layout per layer, per (B, H) pair, accumulated over T tokens:
-  packed_idx:  (B, H, T, n_idx_bytes)  int16  — MSE index bits
-  packed_qjl:  (B, H, T, n_qjl_bytes)  int16  — QJL sign bits
+  packed_idx:  (B, H, T, n_idx_bytes)  int8   — bit-packed MSE indices
+  packed_qjl:  (B, H, T, n_qjl_bytes)  int8   — bit-packed QJL signs
   qjl_gamma:   (B, H, T)               float16 — residual norms
   vec_norm:    (B, H, T)               float16 — original vector norms
 """
@@ -278,8 +278,14 @@ class MPSTurboQuantCache:
         fp = self.fp16_bytes()
         actual = fp / cb if cb > 0 else 0.0
         theory = self.theoretical_compression_ratio()
+
+        def _fmt(b: int) -> str:
+            if b >= 1024 ** 2:
+                return f"{b/1024**2:.1f} MB"
+            return f"{b/1024:.1f} KB"
+
         return (
-            f"Compressed: {cb/1024**2:.1f} MB  |  "
-            f"FP16 equiv: {fp/1024**2:.1f} MB  |  "
+            f"Compressed: {_fmt(cb)}  |  "
+            f"FP16 equiv: {_fmt(fp)}  |  "
             f"Actual {actual:.1f}× (theoretical {theory:.1f}×)"
         )

@@ -27,22 +27,31 @@ from turboquant import TurboQuantMSE, TurboQuantProd
 # ---------------------------------------------------------------------------
 
 def mse_upper_bound(b: int) -> float:
-    """D_mse ≤ √(3π)/2 · 4^{-b}  (Theorem 1, general upper bound)."""
+    """
+    Asymptotic upper bound √(3π)/2 · 4^{-b} (Theorem 1).
+    Derived using the Gaussian approximation to the Beta marginal, valid as d→∞.
+    May be exceeded for finite d at low bit-widths (b ≤ 2), but empirical values
+    converge toward this bound as d grows.
+    """
     return math.sqrt(3 * math.pi) / 2 * (4 ** (-b))
 
 def mse_lower_bound(b: int) -> float:
-    """D_mse ≥ 4^{-b}  (Theorem 3, information-theoretic lower bound)."""
+    """Information-theoretic lower bound 4^{-b} (Theorem 3)."""
     return 4 ** (-b)
 
 # Paper's refined MSE values for b=1,2,3,4 (from Theorem 1 discussion)
 MSE_REFINED = {1: 0.36, 2: 0.117, 3: 0.03, 4: 0.009}
 
 def iprod_upper_bound(b: int, d: int, norm_y: float = 1.0) -> float:
-    """D_prod ≤ √(3π²)·||y||²/d · 4^{-b}  (Theorem 2)."""
+    """
+    Asymptotic upper bound √(3π²)·||y||²/d · 4^{-b} (Theorem 2).
+    Uses the Gaussian approximation; valid as d→∞. For finite d (especially
+    d < 256) empirical D_prod may exceed this value at low bit-widths.
+    """
     return math.sqrt(3 * math.pi**2) * norm_y**2 / d * (4 ** (-b))
 
 def iprod_lower_bound(b: int, d: int, norm_y: float = 1.0) -> float:
-    """D_prod ≥ ||y||²/d · 4^{-b}  (Theorem 3)."""
+    """Information-theoretic lower bound ||y||²/d · 4^{-b} (Theorem 3)."""
     return norm_y**2 / d * (4 ** (-b))
 
 # Paper's refined inner-product distortion values for b=1,2,3,4
@@ -67,7 +76,7 @@ def run_mse_validation(d: int = 512, n: int = 5000, bits: range = range(1, 6)):
         results[b] = d_mse
         ref = MSE_REFINED.get(b, None)
         ref_str = f"  paper_ref≈{ref}" if ref else ""
-        print(f"D_mse = {d_mse:.4f}  (upper={mse_upper_bound(b):.4f}, lower={mse_lower_bound(b):.4f}){ref_str}")
+        print(f"D_mse = {d_mse:.4f}  (asymp_ub={mse_upper_bound(b):.4f}, it_lb={mse_lower_bound(b):.4f}){ref_str}")
     return results
 
 
@@ -91,7 +100,7 @@ def run_iprod_validation(d: int = 512, n: int = 5000, bits: range = range(1, 6))
         results[b] = d_prod
         print(
             f"D_prod = {d_prod:.6f}  "
-            f"(upper={iprod_upper_bound(b, d):.6f}, lower={iprod_lower_bound(b, d):.6f})"
+            f"(asymp_ub={iprod_upper_bound(b, d):.6f}, it_lb={iprod_lower_bound(b, d):.6f})"
         )
     return results
 
@@ -148,8 +157,8 @@ def plot_results(mse_results: dict, iprod_results: dict, d: int, save_path: str 
     # --- MSE plot ---
     ax = axes[0]
     ax.semilogy(b_arr, mse_empirical, "b-o", label="TurboQuant$_{mse}$ (empirical)", linewidth=2)
-    ax.semilogy(b_arr, mse_upper, "r--", label=f"Upper bound: $\\sqrt{{3\\pi}}/2 \\cdot 4^{{-b}}$", linewidth=1.5)
-    ax.semilogy(b_arr, mse_lower, "g--", label="Lower bound: $4^{-b}$", linewidth=1.5)
+    ax.semilogy(b_arr, mse_upper, "r--", label=f"Asymptotic UB (d→∞): $\\sqrt{{3\\pi}}/2 \\cdot 4^{{-b}}$", linewidth=1.5)
+    ax.semilogy(b_arr, mse_lower, "g--", label="IT lower bound: $4^{-b}$", linewidth=1.5)
     refined_vals = [(b, v) for b, v in zip(bits, mse_refined) if v is not None]
     if refined_vals:
         ax.scatter([bv[0] for bv in refined_vals], [bv[1] for bv in refined_vals],
@@ -163,8 +172,8 @@ def plot_results(mse_results: dict, iprod_results: dict, d: int, save_path: str 
     # --- Inner product plot ---
     ax = axes[1]
     ax.semilogy(b_arr, ip_empirical, "purple", marker="o", label="TurboQuant$_{prod}$ (empirical)", linewidth=2)
-    ax.semilogy(b_arr, ip_upper, "r--", label=f"Upper bound: $\\sqrt{{3\\pi^2}}\\|y\\|^2/d \\cdot 4^{{-b}}$", linewidth=1.5)
-    ax.semilogy(b_arr, ip_lower, "g--", label="Lower bound: $\\|y\\|^2/d \\cdot 4^{{-b}}$", linewidth=1.5)
+    ax.semilogy(b_arr, ip_upper, "r--", label=f"Asymptotic UB (d→∞): $\\sqrt{{3\\pi^2}}\\|y\\|^2/d \\cdot 4^{{-b}}$", linewidth=1.5)
+    ax.semilogy(b_arr, ip_lower, "g--", label="IT lower bound: $\\|y\\|^2/d \\cdot 4^{{-b}}$", linewidth=1.5)
     ax.set_xlabel("Bit-width (b)")
     ax.set_ylabel("Inner-Product Distortion ($D_{prod}$)")
     ax.set_title("Inner-Product Distortion")

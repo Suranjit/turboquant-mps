@@ -180,7 +180,7 @@ class MPSTurboQuantMSE:
         Normalise, quantize, and pack indices.
 
         Returns:
-            packed_idx: (..., ceil(b*d/8)) int16
+            packed_idx: (..., ceil(b*d/8)) int8  — bit-packed indices
             norms:      (...,) float16
         """
         norms = x.norm(dim=-1).clamp(min=1e-12)         # (...,)
@@ -298,8 +298,8 @@ class MPSTurboQuantProd:
         Normalise, quantize, and pack into compact storage.
 
         Returns:
-            packed_idx:   (..., ceil((b-1)*d/8)) int16
-            packed_qjl:   (..., ceil(d/8))       int16
+            packed_idx:   (..., ceil((b-1)*d/8)) int8   — bit-packed MSE indices
+            packed_qjl:   (..., ceil(d/8))       int8   — bit-packed QJL signs
             qjl_gamma:    (...,)                 float16
             norms:        (...,)                 float16
         """
