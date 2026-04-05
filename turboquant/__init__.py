@@ -24,12 +24,36 @@ from .kv_cache import TurboQuantDynamicCache
 from .mps_quantizer import MPSTurboQuantMSE, MPSTurboQuantProd
 from .mps_kv_cache import MPSTurboQuantCache
 
+# Production Metal shader backend
+from .metal import MetalTurboQuantMSE, MetalTurboQuantProd, metal_available
+from .production import (
+    ProductionTurboQuantCache,
+    LlamaVariant,
+    get_model_config,
+    SUPPORTED_MODELS,
+    patch_llama_model,
+    unpatch_llama_model,
+)
+
 __all__ = [
+    # Core numpy quantizers
     "TurboQuantMSE",
     "TurboQuantProd",
     "TurboQuantDynamicCache",
+    # PyTorch MPS quantizers
     "MPSTurboQuantMSE",
     "MPSTurboQuantProd",
     "MPSTurboQuantCache",
+    # Metal shader quantizers (with PyTorch MPS fallback)
+    "MetalTurboQuantMSE",
+    "MetalTurboQuantProd",
+    "metal_available",
+    # Production multi-model cache
+    "ProductionTurboQuantCache",
+    "LlamaVariant",
+    "get_model_config",
+    "SUPPORTED_MODELS",
+    "patch_llama_model",
+    "unpatch_llama_model",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
