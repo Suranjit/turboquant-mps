@@ -43,12 +43,15 @@ class TurboQuantMSE:
         self.b = b
 
         rng = np.random.default_rng(seed)
-        # Generate orthogonal rotation matrix via QR decomposition
+        # Generate orthogonal rotation matrix via QR decomposition.
+        # QR is computed in float64 for numerical stability, then stored as
+        # float32 to match the MPS quantizer and keep memory usage consistent.
         raw = rng.standard_normal((d, d))
-        self.rotation, _ = np.linalg.qr(raw)          # Π : shape (d, d)
+        rotation_f64, _ = np.linalg.qr(raw)
+        self.rotation = rotation_f64.astype(np.float32)  # Π : shape (d, d)
 
-        # Precomputed Lloyd-Max codebook
-        self.codebook = get_codebook(d, b)             # shape (2^b,)
+        # Precomputed Lloyd-Max codebook (float32)
+        self.codebook = get_codebook(d, b).astype(np.float32)  # shape (2^b,)
 
     # ------------------------------------------------------------------
     # Public API
